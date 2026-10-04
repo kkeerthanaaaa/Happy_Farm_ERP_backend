@@ -64,3 +64,75 @@ export async function getReportById(
     next(error);
   }
 }
+
+export async function exportProductionCurveReport(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const startDate = (req.query['startDate'] as string) || new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().split('T')[0]!;
+    const endDate = (req.query['endDate'] as string) || new Date().toISOString().split('T')[0]!;
+    const requestId = req.requestId!;
+    const user = req.user;
+
+    const farmIdParam = req.query['farmId'] as string | undefined;
+    let targetFarmIds: string[] | undefined = undefined;
+
+    if (user && user.role !== UserRole.ADMIN && user.role !== UserRole.OFFICE_STAFF) {
+      if (farmIdParam) {
+        if (!user.farmIds.includes(farmIdParam)) {
+          logger.warn('Export denied: unauthorized farmId parameter', {
+            requestId,
+            userId: user.uid,
+            requestedFarmId: farmIdParam,
+            allowedFarmIds: user.farmIds,
+          });
+          res.status(403).json({
+            success: false,
+            error: {
+              code: 'AUTHORIZATION_DENIED',
+              message: 'Access to this farm is denied',
+            },
+          });
+          return;
+        }
+        targetFarmIds = [farmIdParam];
+      } else {
+        if (!user.farmIds || user.farmIds.length === 0) {
+          logger.warn('Export denied: user has no assigned farms', {
+            requestId,
+            userId: user.uid,
+          });
+          res.status(403).json({
+            success: false,
+            error: {
+              code: 'AUTHORIZATION_DENIED',
+              message: 'No assigned farms found for export',
+            },
+          });
+          return;
+        }
+        targetFarmIds = user.farmIds;
+      }
+    } else {
+      if (farmIdParam) {
+        targetFarmIds = [farmIdParam];
+      }
+    }
+
+    const { buffer, filename } = await reportsService.generateProductionCurveExport(
+      startDate,
+      endDate,
+      requestId,
+      targetFarmIds,
+    );
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.status(200).send(buffer);
+  } catch (error) {
+    next(error);
+  }
+}
+

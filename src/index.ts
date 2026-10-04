@@ -24,15 +24,32 @@ function createApp(): express.Express {
   const app = express();
   app.set('trust proxy', 1);
 
+  const allowedOrigins = env.ALLOWED_ORIGINS.split(',').map((o) => o.trim());
+
   app.use(helmet());
   app.use(cors({
-    origin: env.ALLOWED_ORIGINS.split(','),
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+
+      if (env.NODE_ENV === 'development') {
+        if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+          return callback(null, true);
+        }
+      }
+
+      if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+        return callback(null, true);
+      }
+
+      return callback(null, false);
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
     credentials: true,
   }));
 
-  app.use(express.json({ limit: '100kb' }));
+
+  app.use(express.json({ limit: '10mb' }));
 
   app.use((req, _res, next) => {
     req.requestId = generateRequestId();
@@ -47,7 +64,7 @@ function createApp(): express.Express {
   app.use('/api/v1/admin', adminRouter);
 
   app.get('/health', (_req, res) => {
-    res.status(200).json({ status: 'ok' });
+    res.status(200).json({ status: 'ok', version: 'v2' });
   });
 
   app.get('/', (_req, res) => {
@@ -63,7 +80,7 @@ if (require.main === module) {
   const app = createApp();
   const env = getEnv();
 
-  app.listen(env.PORT, () => {
+  app.listen(env.PORT, '0.0.0.0', () => {
     logger.info(`SAI Happy Farms API running on port ${env.PORT}`, {
       environment: env.NODE_ENV,
     });

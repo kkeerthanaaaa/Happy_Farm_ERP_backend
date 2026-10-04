@@ -179,6 +179,8 @@ export class ReportsService {
 
     const payload = { farms: farmsPayload };
 
+    logger.info('DEBUG: generateProductionCurveExport v2 is running on Render!');
+
     // Resolve project root: works both in src/ (ts-node) and dist/ (node)
     const projectRoot = path.resolve(__dirname, '..', '..');
     const tmpDir = path.join(projectRoot, 'scratch');

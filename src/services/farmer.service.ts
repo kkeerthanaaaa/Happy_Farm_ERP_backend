@@ -1,13 +1,16 @@
 import * as admin from 'firebase-admin';
 import { getFirestore, getAuth } from '../config/firebase';
 import { AuditService } from './audit.service';
-import { DuplicateError, NotFoundError } from '../utils/errors';
+import { DuplicateError, NotFoundError, ValidationError } from '../utils/errors';
 import { logger } from '../utils/logger';
 import { CreateFarmerInput } from '../validators/farmer.validator';
+import { getIstDate } from '../utils/date';
 
 interface CreatedFarmer {
   uid: string;
   email: string;
+  farmId: string;
+  flockId?: string;
 }
 
 export class FarmerService {
@@ -26,6 +29,14 @@ export class FarmerService {
     createdByUid: string,
     requestId: string,
   ): Promise<CreatedFarmer> {
+    const cleanFarmId = input.farmId.trim();
+    if (!cleanFarmId) {
+      throw new ValidationError('Farm ID is required');
+    }
+
+    // 0. Check for duplicate farm ID in existing farms
+    await this.checkDuplicateFarmId(cleanFarmId, requestId);
+
     // 1. Check for duplicate farm name in existing farms
     await this.checkDuplicateFarmName(input.farmName, requestId);
 
@@ -63,64 +74,39 @@ export class FarmerService {
       throw err;
     }
 
-    // 4. Create Firestore user and farm document using a Transaction to generate safe Farm ID
-    let newFarmId = '';
+    // 4. Create Firestore user, farm, opening flock and initial feed stock inside an atomic Transaction
+    const newFarmId = cleanFarmId;
+    let openingFlockId: string | undefined = undefined;
     try {
       await this.db.runTransaction(async (t) => {
-        // Read all farms to find max suffix and detect pattern dynamically
-        const farmsSnapshot = await t.get(this.db.collection('farms'));
-        
-        let detectedPrefix: string | null = null;
-        let detectedPadding: number | null = null;
-        let maxNumber = 0;
-        let validFarmsCount = 0;
-
-        for (const doc of farmsSnapshot.docs) {
-          if (doc.data().name?.toLowerCase() === input.farmName.toLowerCase()) {
-            throw new DuplicateError('A farm with this name already exists.');
-          }
-          
-          const id = doc.id;
-          const match = id.match(/^(.*?)(\d+)$/);
-          
-          if (!match) {
-            continue; // Skip farms that don't match the sequential pattern
-          }
-          
-          validFarmsCount++;
-          const prefix = match[1] || '';
-          const numStr = match[2] || '';
-          const num = parseInt(numStr, 10);
-          const padding = numStr.startsWith('0') ? numStr.length : 0;
-
-          if (detectedPrefix === null) {
-            detectedPrefix = prefix;
-            detectedPadding = padding;
-          } else if (detectedPrefix !== prefix) {
-            throw new Error(`Ambiguous Farm ID pattern detected. Found conflicting prefixes: '${detectedPrefix}' and '${prefix}'.`);
-          } else if (detectedPadding !== null && detectedPadding !== padding && numStr.startsWith('0')) {
-            detectedPadding = Math.max(detectedPadding, padding);
-          }
-
-          if (num > maxNumber) {
-            maxNumber = num;
-          }
-        }
-
-        if (validFarmsCount === 0 || detectedPrefix === null) {
-          throw new Error('Cannot detect Farm ID pattern: No existing farms have a sequential numeric suffix to derive the format from.');
-        }
-
-        const nextNumber = maxNumber + 1;
-        let nextNumberStr = nextNumber.toString();
-        
-        if (detectedPadding !== null && detectedPadding > 0) {
-          nextNumberStr = nextNumberStr.padStart(detectedPadding, '0');
-        }
-
-        newFarmId = `${detectedPrefix}${nextNumberStr}`;
-
         const farmRef = this.db.collection('farms').doc(newFarmId);
+        const farmSnap = await t.get(farmRef);
+        if (farmSnap.exists) {
+          throw new DuplicateError(`A farm with ID "${newFarmId}" already exists.`, {
+            farmId: `A farm with ID "${newFarmId}" already exists.`,
+          });
+        }
+
+        const duplicateNameSnap = await t.get(
+          this.db.collection('farms').where('name', '==', input.farmName).limit(1)
+        );
+        if (!duplicateNameSnap.empty) {
+          throw new DuplicateError('A farm with this name already exists.');
+        }
+
+        // Idempotency checks before writes:
+        const existingFlocksSnap = await t.get(
+          this.db.collection('flocks').where('farmId', '==', newFarmId).limit(1)
+        );
+        const existingFeedLogsSnap = await t.get(
+          this.db.collection('logs').doc(newFarmId).collection('feedLogs').limit(1)
+        );
+
+        const initialBirds = Math.max(0, Math.floor(Number(input.initialBirdCount || 0)));
+        const initialFeed = Math.max(0, Number(input.initialFeedKg || 0));
+        const nowIso = new Date().toISOString();
+        const istDate = getIstDate();
+
         const userRef = this.db.collection('users').doc(authUser.uid);
 
         const farmDoc = {
@@ -128,15 +114,16 @@ export class FarmerService {
           name: input.farmName,
           location: '',
           active: true,
-          initialBirdCount: input.initialBirdCount ?? 0,
-          currentBirdCount: input.initialBirdCount ?? 0,
-          initialFeedKg: input.initialFeedKg ?? 0,
-          currentFeedKg: input.initialFeedKg ?? 0,
-          totalFeedLoadedKg: input.initialFeedKg ?? 0,
+          initialBirdCount: initialBirds,
+          currentBirdCount: initialBirds,
+          initialFeedKg: initialFeed,
+          currentFeedKg: initialFeed,
+          totalFeedLoadedKg: initialFeed,
           totalFeedConsumedKg: 0,
           inventoryInitialized: true,
           inventoryInitializedAt: admin.firestore.FieldValue.serverTimestamp(),
           inventoryUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastTransactionDate: initialFeed > 0 ? istDate : '',
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
 
@@ -153,12 +140,99 @@ export class FarmerService {
 
         t.set(farmRef, farmDoc);
         t.set(userRef, userDoc);
+
+        // Phase 2: Create opening flock if initialBirdCount > 0 and not already existing
+        if (initialBirds > 0 && existingFlocksSnap.empty) {
+          const flockRef = this.db.collection('flocks').doc();
+          openingFlockId = flockRef.id;
+
+          const flockDoc = {
+            flockId: flockRef.id,
+            farmId: newFarmId,
+            flockName: 'Flock 1',
+            initialBirds: initialBirds,
+            currentBirds: initialBirds,
+            totalMortality: 0,
+            totalCulling: 0,
+            totalEggs: 0,
+            startDate: istDate,
+            currentAgeWeeks: 0,
+            breedType: 'BV-300',
+            productionCurve: 'CF_STD',
+            status: 'active',
+            batchNumber: 1,
+            isInitialFlock: true,
+            notes: 'Opening flock created with farmer account',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          };
+          t.set(flockRef, flockDoc);
+
+          // Record Bird Transaction Audit
+          const birdTxRef = farmRef.collection('birdTransactions').doc();
+          t.set(birdTxRef, {
+            farmId: newFarmId,
+            flockId: flockRef.id,
+            type: 'INITIAL',
+            count: initialBirds,
+            reportDate: istDate,
+            createdAt: nowIso,
+            notes: 'Initial flock creation from farm creation',
+          });
+
+          // Record Farm-wise Flock Log
+          const flockLogRef = this.db.collection('logs').doc(newFarmId).collection('flockLogs').doc(flockRef.id);
+          t.set(flockLogRef, {
+            logId: flockRef.id,
+            farmId: newFarmId,
+            flockId: flockRef.id,
+            flockName: 'Flock 1',
+            initialBirds: initialBirds,
+            currentBirds: initialBirds,
+            startDate: istDate,
+            breedType: 'BV-300',
+            status: 'active',
+            batchNumber: 1,
+            isInitialFlock: true,
+            createdAt: nowIso,
+            notes: 'Initial flock creation from farm creation',
+            type: 'FLOCK_CREATION',
+          });
+        }
+
+        // Phase 3: Create opening feed log & transaction if initialFeed > 0 and not already existing
+        if (initialFeed > 0 && existingFeedLogsSnap.empty) {
+          const feedLogRef = this.db.collection('logs').doc(newFarmId).collection('feedLogs').doc();
+          t.set(feedLogRef, {
+            logId: feedLogRef.id,
+            farmId: newFarmId,
+            quantityKg: initialFeed,
+            previousStockKg: 0,
+            newStockKg: initialFeed,
+            loadedAt: nowIso,
+            recordedBy: createdByUid,
+            notes: 'Initial opening feed stock balance',
+            type: 'FEED_LOAD',
+          });
+
+          const feedTxRef = farmRef.collection('feedTransactions').doc();
+          t.set(feedTxRef, {
+            farmId: newFarmId,
+            type: 'FEED_LOAD',
+            feedKg: initialFeed,
+            reportDate: istDate,
+            createdAt: nowIso,
+            loadedBy: createdByUid,
+            notes: 'Initial feed stock balance',
+          });
+        }
       });
 
-      logger.info('Firestore user and farm documents created', {
+      logger.info('Firestore user, farm, and initial inventory documents created', {
         requestId,
         newUserId: authUser.uid,
         newFarmId,
+        openingFlockId,
         role: 'farmer',
       });
     } catch (err: any) {
@@ -195,13 +269,28 @@ export class FarmerService {
       metadata: {
         createdUserRole: 'farmer',
         assignedFarmIds: [newFarmId],
+        initialBirdCount: Number(input.initialBirdCount || 0),
+        initialFeedKg: Number(input.initialFeedKg || 0),
+        openingFlockId,
       },
     });
 
     return {
       uid: authUser.uid,
       email: input.email,
+      farmId: newFarmId,
+      flockId: openingFlockId,
     };
+  }
+
+  private async checkDuplicateFarmId(farmId: string, requestId: string): Promise<void> {
+    const doc = await this.db.collection('farms').doc(farmId).get();
+    if (doc.exists) {
+      logger.warn('Farm ID duplicate check failed', { requestId, farmId });
+      throw new DuplicateError(`A farm with ID "${farmId}" already exists.`, {
+        farmId: `A farm with ID "${farmId}" already exists.`,
+      });
+    }
   }
 
   private async checkDuplicateFarmName(farmName: string, requestId: string): Promise<void> {
@@ -267,11 +356,26 @@ export class FarmerService {
     adminUid: string,
     requestId: string,
   ): Promise<{ uid: string; active: boolean }> {
+    if (!active && targetUid === adminUid) {
+      throw new ValidationError('You cannot deactivate your own authenticated administrator account.');
+    }
+
     const userRef = this.db.collection('users').doc(targetUid);
     const userDoc = await userRef.get();
 
     if (!userDoc.exists) {
       throw new NotFoundError('User');
+    }
+
+    const userData = userDoc.data() || {};
+    const role = (userData['role'] || '').toLowerCase();
+
+    if (!active && role === 'admin') {
+      const allAdminsSnap = await this.db.collection('users').where('role', '==', 'admin').get();
+      const activeAdmins = allAdminsSnap.docs.filter((d) => d.data()['active'] !== false);
+      if (activeAdmins.length <= 1) {
+        throw new ValidationError('Cannot deactivate the last remaining active administrator.');
+      }
     }
 
     const now = new Date().toISOString();
@@ -298,11 +402,13 @@ export class FarmerService {
     }
 
     await this.auditService.log({
-      eventType: 'USER_STATUS_UPDATED',
+      eventType: active ? 'USER_ACTIVATED' : 'USER_DEACTIVATED',
       uid: adminUid,
       resourceId: targetUid,
       requestId,
       metadata: {
+        targetRole: role,
+        targetEmail: userData['email'] || '',
         newStatus: active ? 'active' : 'inactive',
       },
     });
